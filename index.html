@@ -29,11 +29,7 @@
       border-bottom:1px solid var(--line);
       z-index:10;
     }
-    .wrap{
-      max-width:1100px;
-      margin:0 auto;
-      padding:16px;
-    }
+    .wrap{ max-width:1100px; margin:0 auto; padding:16px; }
     h1{ margin:0 0 6px 0; font-size:18px; }
     .subhead{ margin:0; font-size:12px; color:var(--muted); }
 
@@ -88,7 +84,7 @@
     <h1>🗞️ Clipping automático — STF</h1>
     <p class="subhead">
       Lista única de notícias sobre o STF e seus ministros,
-      ordenada pela hora real de publicação das matérias.
+      ordenada pelo horário real de publicação (convertido para Brasília).
     </p>
 
     <div class="row">
@@ -107,8 +103,7 @@
 </main>
 
 <footer class="wrap">
-  Este site é um agregador de links de notícias públicas.
-  Todo o conteúdo pertence aos veículos originais.
+  Este site é um agregador de links de notícias públicas. Todo o conteúdo pertence aos veículos originais.
 </footer>
 
 <script>
@@ -171,7 +166,7 @@ const els = {
 };
 
 function normalize(t){
-  return t.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+  return (t||"").toString().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
 }
 
 function matchesSTF(item){
@@ -179,8 +174,47 @@ function matchesSTF(item){
   return KEYWORDS.some(k => text.includes(normalize(k)));
 }
 
-/* 👉 DATA + HORA DA PUBLICAÇÃO (fuso Brasil) */
-function formatDateTime(date){
+/**
+ * Parser robusto:
+ * - Se a string já tem timezone (Z, +00:00, GMT, UTC), usa direto.
+ * - Se NÃO tem timezone (muito comum no rss2json), assume UTC e adiciona "Z".
+ * Isso evita "adiantar" dia/hora no Brasil.
+ */
+function parseFeedDate(raw){
+  if(!raw) return null;
+  const s = String(raw).trim();
+
+  // já tem timezone explícito
+  if (/(Z|[+-]\d{2}:?\d{2}|GMT|UTC)\b/i.test(s)) {
+    const d = new Date(s);
+    return isNaN(d) ? null : d;
+  }
+
+  // formato "YYYY-MM-DD HH:MM" ou "YYYY-MM-DD HH:MM:SS"
+  if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(s)) {
+    let iso = s.replace(/\s+/, "T");
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(iso)) iso += ":00";
+    iso += "Z"; // assume UTC
+    const d = new Date(iso);
+    return isNaN(d) ? null : d;
+  }
+
+  // formato ISO sem timezone "YYYY-MM-DDTHH:MM" / "YYYY-MM-DDTHH:MM:SS"
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(s)) {
+    let iso = s;
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(iso)) iso += ":00";
+    iso += "Z"; // assume UTC
+    const d = new Date(iso);
+    return isNaN(d) ? null : d;
+  }
+
+  // fallback
+  const d = new Date(s);
+  return isNaN(d) ? null : d;
+}
+
+/* Data + hora exibidas em Brasília */
+function formatDateTimeBR(date){
   return new Intl.DateTimeFormat("pt-BR", {
     timeZone: "America/Sao_Paulo",
     day: "2-digit",
@@ -196,15 +230,16 @@ async function fetchFeed(feed){
   const data = await res.json();
 
   return (data.items||[]).map(i=>{
-    const raw = i.pubDate || i.publishedDate || i.date || null;
-    const d = raw ? new Date(raw) : null;
+    const raw = i.pubDate || i.publishedDate || i.date || i.isoDate || null;
+    const d = parseFeedDate(raw);
 
     return {
-      title: i.title,
-      link: i.link,
+      title: i.title || "(sem título)",
+      link: i.link || "",
       description: i.description || "",
       source: feed.name,
-      date: d && !isNaN(d) ? d : null
+      date: d,
+      rawDate: raw
     };
   });
 }
@@ -228,11 +263,11 @@ function render(items){
         <a href="${n.link}" target="_blank" rel="noopener">${n.title}</a>
       </h2>
       <div class="date">
-        🕒 ${n.date ? formatDateTime(n.date) : "Horário não informado pela fonte"}
+        🕒 ${n.date ? formatDateTimeBR(n.date) : "Horário não informado pela fonte"}
       </div>
       <div class="link">${n.link}</div>
       <div class="actions">
-        <a href="${wa}" target="_blank">
+        <a href="${wa}" target="_blank" rel="noopener">
           <button>Compartilhar no WhatsApp</button>
         </a>
       </div>
@@ -254,9 +289,11 @@ async function run(){
 
   let filtered = all.filter(matchesSTF);
 
+  // dedupe por link
   filtered = [...new Map(filtered.map(i => [i.link, i])).values()];
 
-  filtered.sort((a,b) => (b.date || 0) - (a.date || 0));
+  // mais novo em cima: sem data vai pro final
+  filtered.sort((a,b) => ((b.date?.getTime?.() || 0) - (a.date?.getTime?.() || 0)));
 
   els.status.textContent = `Atualizado • ${filtered.length} notícia(s)`;
   render(filtered);
