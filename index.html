@@ -31,7 +31,7 @@
     }
     .wrap{ max-width:1100px; margin:0 auto; padding:16px; }
     h1{ margin:0 0 6px 0; font-size:18px; }
-    .subhead{ margin:0; font-size:12px; color:var(--muted); }
+    .subhead{ margin:0; font-size:12px; color:var(--muted); line-height:1.4; }
 
     button, select{
       border:1px solid var(--line);
@@ -73,6 +73,14 @@
 
     .actions{ margin-top:12px; display:flex; gap:10px; flex-wrap:wrap; }
 
+    .controlsBottom{
+      padding:0 16px 24px;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+
     footer{ padding:0 16px 24px; font-size:12px; color:var(--muted); }
   </style>
 </head>
@@ -83,15 +91,17 @@
   <div class="wrap">
     <h1>🗞️ Clipping automático — STF</h1>
     <p class="subhead">
-      Lista única de notícias sobre o STF e seus ministros,
-      ordenada pelo horário real de publicação (convertido para Brasília).
+      Lista única de notícias sobre o STF e seus ministros (atuais e ex), ordenada pelo horário de publicação.
+      <br/>Inclui “Carregar mais” e “Gerar resumo para WhatsApp”.
     </p>
 
     <div class="row">
       <select id="source">
         <option value="ALL">Todos os jornais</option>
       </select>
+
       <button id="refreshBtn" class="primary">Atualizar agora</button>
+      <button id="summaryBtn">Gerar resumo para WhatsApp</button>
     </div>
 
     <div class="status" id="status">Pronta para atualizar.</div>
@@ -100,6 +110,11 @@
 
 <main class="wrap">
   <div class="grid" id="list"></div>
+
+  <div class="controlsBottom">
+    <button id="loadMoreBtn">Carregar mais</button>
+    <span class="status" id="countInfo"></span>
+  </div>
 </main>
 
 <footer class="wrap">
@@ -155,14 +170,22 @@ const KEYWORDS = [
   "nunes marques","nunes"
 ];
 
+/* ================= CONFIG PAGINAÇÃO/RESUMO ================= */
+const PAGE_SIZE = 30;     // quantas notícias aparecem por vez
+const SUMMARY_MAX = 10;   // quantas notícias entram no resumo do WhatsApp
+
+/* ================= RSS -> JSON (GitHub Pages) ================= */
 const RSS2JSON = url =>
   `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(url)}`;
 
 const els = {
   source: document.getElementById("source"),
   refresh: document.getElementById("refreshBtn"),
+  summary: document.getElementById("summaryBtn"),
+  loadMore: document.getElementById("loadMoreBtn"),
   list: document.getElementById("list"),
-  status: document.getElementById("status")
+  status: document.getElementById("status"),
+  countInfo: document.getElementById("countInfo")
 };
 
 function normalize(t){
@@ -176,21 +199,19 @@ function matchesSTF(item){
 
 /**
  * Parser robusto:
- * - Se a string já tem timezone (Z, +00:00, GMT, UTC), usa direto.
- * - Se NÃO tem timezone (muito comum no rss2json), assume UTC e adiciona "Z".
- * Isso evita "adiantar" dia/hora no Brasil.
+ * - Se vier sem timezone, assume UTC (Z), evitando "virar o dia/hora" errado.
  */
 function parseFeedDate(raw){
   if(!raw) return null;
   const s = String(raw).trim();
 
-  // já tem timezone explícito
+  // já tem timezone explícito (Z, +03:00, -0300, GMT, UTC)
   if (/(Z|[+-]\d{2}:?\d{2}|GMT|UTC)\b/i.test(s)) {
     const d = new Date(s);
     return isNaN(d) ? null : d;
   }
 
-  // formato "YYYY-MM-DD HH:MM" ou "YYYY-MM-DD HH:MM:SS"
+  // "YYYY-MM-DD HH:MM(:SS)?"
   if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(s)) {
     let iso = s.replace(/\s+/, "T");
     if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(iso)) iso += ":00";
@@ -199,7 +220,7 @@ function parseFeedDate(raw){
     return isNaN(d) ? null : d;
   }
 
-  // formato ISO sem timezone "YYYY-MM-DDTHH:MM" / "YYYY-MM-DDTHH:MM:SS"
+  // ISO sem timezone "YYYY-MM-DDTHH:MM(:SS)?"
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(s)) {
     let iso = s;
     if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(iso)) iso += ":00";
@@ -208,7 +229,6 @@ function parseFeedDate(raw){
     return isNaN(d) ? null : d;
   }
 
-  // fallback
   const d = new Date(s);
   return isNaN(d) ? null : d;
 }
@@ -225,6 +245,91 @@ function formatDateTimeBR(date){
   }).format(date);
 }
 
+/* ================= ESTADO (para Carregar Mais) ================= */
+let allFiltered = [];   // lista completa já filtrada e ordenada
+let shownCount = 0;     // quantos já estão na tela
+
+function updateCountInfo(){
+  const total = allFiltered.length;
+  els.countInfo.textContent = total
+    ? `Mostrando ${Math.min(shownCount, total)} de ${total}`
+    : "";
+  els.loadMore.style.display = (shownCount < total) ? "inline-block" : "none";
+  els.summary.disabled = (Math.min(shownCount, total) === 0);
+}
+
+function render(reset = false){
+  if (reset) els.list.innerHTML = "";
+
+  const total = allFiltered.length;
+  const slice = allFiltered.slice(0, shownCount);
+
+  if (!total) {
+    els.list.innerHTML = "<div class='card'>Nenhuma notícia encontrada.</div>";
+    updateCountInfo();
+    return;
+  }
+
+  // Renderiza somente os itens que ainda não estavam na tela
+  const start = reset ? 0 : Math.max(0, slice.length - PAGE_SIZE);
+  for (let i = start; i < slice.length; i++) {
+    const n = slice[i];
+    const wa = `https://wa.me/?text=${encodeURIComponent(n.title + "\n" + n.link)}`;
+
+    const card = document.createElement("div");
+    card.className="card";
+    card.innerHTML = `
+      <div class="pill">${n.source}</div>
+      <h2 class="title">
+        <a href="${n.link}" target="_blank" rel="noopener">${n.title}</a>
+      </h2>
+      <div class="date">🕒 ${n.date ? formatDateTimeBR(n.date) : "Horário não informado pela fonte"}</div>
+      <div class="link">${n.link}</div>
+      <div class="actions">
+        <a href="${wa}" target="_blank" rel="noopener">
+          <button>Compartilhar no WhatsApp</button>
+        </a>
+      </div>
+    `;
+    els.list.appendChild(card);
+  }
+
+  updateCountInfo();
+}
+
+function loadMore(){
+  shownCount = Math.min(shownCount + PAGE_SIZE, allFiltered.length);
+  render(false);
+}
+
+/* ================= RESUMO PARA WHATSAPP ================= */
+function openWhatsAppSummary(){
+  const totalShown = Math.min(shownCount, allFiltered.length);
+  if (!totalShown) return;
+
+  const pick = allFiltered.slice(0, totalShown).slice(0, SUMMARY_MAX);
+
+  const nowBR = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date());
+
+  const sourceLabel = (els.source.value === "ALL") ? "Todas as fontes" : els.source.value;
+
+  let msg = `🗞️ Resumo STF (${nowBR})\nFonte: ${sourceLabel}\n\n`;
+  pick.forEach((n, idx) => {
+    msg += `${idx+1}) ${n.title}\n${n.link}\n\n`;
+  });
+
+  const wa = `https://wa.me/?text=${encodeURIComponent(msg.trim())}`;
+  window.open(wa, "_blank", "noopener");
+}
+
+/* ================= COLETA ================= */
 async function fetchFeed(feed){
   const res = await fetch(RSS2JSON(feed.url));
   const data = await res.json();
@@ -238,46 +343,14 @@ async function fetchFeed(feed){
       link: i.link || "",
       description: i.description || "",
       source: feed.name,
-      date: d,
-      rawDate: raw
+      date: d
     };
-  });
-}
-
-function render(items){
-  els.list.innerHTML = "";
-
-  if(!items.length){
-    els.list.innerHTML = "<div class='card'>Nenhuma notícia encontrada.</div>";
-    return;
-  }
-
-  items.forEach(n=>{
-    const wa = `https://wa.me/?text=${encodeURIComponent(n.title + "\n" + n.link)}`;
-
-    const card = document.createElement("div");
-    card.className="card";
-    card.innerHTML = `
-      <div class="pill">${n.source}</div>
-      <h2 class="title">
-        <a href="${n.link}" target="_blank" rel="noopener">${n.title}</a>
-      </h2>
-      <div class="date">
-        🕒 ${n.date ? formatDateTimeBR(n.date) : "Horário não informado pela fonte"}
-      </div>
-      <div class="link">${n.link}</div>
-      <div class="actions">
-        <a href="${wa}" target="_blank" rel="noopener">
-          <button>Compartilhar no WhatsApp</button>
-        </a>
-      </div>
-    `;
-    els.list.appendChild(card);
   });
 }
 
 async function run(){
   els.refresh.disabled = true;
+  els.summary.disabled = true;
   els.status.textContent = "Atualizando…";
 
   const pick = els.source.value;
@@ -287,20 +360,26 @@ async function run(){
   const results = await Promise.allSettled(feeds.map(fetchFeed));
   results.forEach(r => { if(r.status === "fulfilled") all.push(...r.value); });
 
+  // filtro STF
   let filtered = all.filter(matchesSTF);
 
   // dedupe por link
   filtered = [...new Map(filtered.map(i => [i.link, i])).values()];
 
-  // mais novo em cima: sem data vai pro final
+  // ordena por data: mais novo em cima (sem data vai pro final)
   filtered.sort((a,b) => ((b.date?.getTime?.() || 0) - (a.date?.getTime?.() || 0)));
 
-  els.status.textContent = `Atualizado • ${filtered.length} notícia(s)`;
-  render(filtered);
+  // atualiza estado + primeira página
+  allFiltered = filtered;
+  shownCount = Math.min(PAGE_SIZE, allFiltered.length);
+
+  els.status.textContent = `Atualizado • ${allFiltered.length} notícia(s)`;
+  render(true);
 
   els.refresh.disabled = false;
 }
 
+/* ================= INIT ================= */
 FEEDS.forEach(f=>{
   const o=document.createElement("option");
   o.value=f.name;
@@ -309,7 +388,16 @@ FEEDS.forEach(f=>{
 });
 
 els.refresh.addEventListener("click", run);
+els.loadMore.addEventListener("click", loadMore);
+els.summary.addEventListener("click", openWhatsAppSummary);
+
+// quando mudar jornal, atualiza
+els.source.addEventListener("change", run);
+
+// auto refresh (10 min)
 setInterval(run, 10 * 60 * 1000);
+
+// primeira carga
 run();
 </script>
 
